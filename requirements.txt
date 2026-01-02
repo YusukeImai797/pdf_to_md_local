@@ -1,0 +1,5 @@
+requests==2.31.0
+pdf2image==1.17.0
+pymupdf==1.23.26
+python-dotenv==1.0.1
+tqdm==4.66.2
