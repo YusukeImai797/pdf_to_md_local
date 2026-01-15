@@ -42,7 +42,7 @@ from lmstudio_client import LMStudioClient
 class ConverterConfig:
     vision_model: str = "qwen/qwen2.5-vl-7b"
     # Text model for optional LLM audit (not used for body text)
-    text_model: Optional[str] = None
+    text_model: Optional[str] = "deepseek/deepseek-r1-0528-qwen3-8b"
 
     # rendering
     render_dpi: int = 200
@@ -62,6 +62,11 @@ class ConverterConfig:
 
     # fail-fast / retry
     max_retries_per_figure: int = 1
+
+    # LLM-based structuring (sidecar enrichment)
+    enable_llm_structuring: bool = True
+    llm_temperature: float = 0.1
+    llm_max_tokens: int = 800
 
 
 # ----------------------------
@@ -318,6 +323,229 @@ def _extract_label_from_caption(text: str) -> Optional[str]:
     if not m:
         return None
     return m.group(0).replace("FIGURE", "Figure").replace("FIG.", "Fig.").replace("TABLE", "Table").replace("TAB.", "Tab.")
+
+
+def _strip_fence(text: str) -> str:
+    t = text.strip()
+    if t.startswith("```") and t.endswith("```"):
+        parts = t.split("\n")
+        if len(parts) >= 3:
+            return "\n".join(parts[1:-1]).strip()
+    return t
+
+
+def _extract_json(text: str) -> Optional[Dict[str, Any]]:
+    t = _strip_fence(text)
+    t = t.strip()
+    if not t:
+        return None
+    try:
+        return json.loads(t)
+    except Exception:
+        pass
+    # try to extract first {...}
+    m = re.search(r"\{[\s\S]*\}", t)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
+
+
+def _paragraphs_from_md(md: str) -> List[Dict[str, Any]]:
+    lines = md.splitlines()
+    paragraphs: List[Dict[str, Any]] = []
+    cur: List[str] = []
+    start = None
+    heading_ctx = ""
+
+    def _flush(end_idx: int) -> None:
+        nonlocal cur, start
+        if not cur:
+            return
+        text = "\n".join(cur).strip()
+        if text:
+            paragraphs.append({
+                "start_line": start + 1,
+                "end_line": end_idx + 1,
+                "text": text,
+                "heading": heading_ctx,
+            })
+        cur = []
+        start = None
+
+    for idx, line in enumerate(lines):
+        if line.strip().startswith("```"):
+            _flush(idx - 1)
+            continue
+        if line.startswith("#"):
+            _flush(idx - 1)
+            heading_ctx = line.lstrip("#").strip()
+            continue
+        if line.strip() == "":
+            _flush(idx - 1)
+            continue
+        if line.lstrip().startswith("|"):
+            _flush(idx - 1)
+            continue
+        if line.strip().startswith("- (Generated)"):
+            _flush(idx - 1)
+            continue
+        if _is_caption_or_placeholder_line(line):
+            _flush(idx - 1)
+            continue
+        if start is None:
+            start = idx
+        cur.append(line)
+
+    _flush(len(lines) - 1)
+    return paragraphs
+
+
+def _normalize_reason(reason: Dict[str, Any], para_text: str) -> Dict[str, Any]:
+    status = reason.get("status") or "missing"
+    evidence_text = reason.get("evidence_text") or []
+    if isinstance(evidence_text, str):
+        evidence_text = [evidence_text]
+    kept: List[str] = []
+    for e in evidence_text:
+        if e and e.lower() in para_text.lower():
+            kept.append(e)
+    if not kept:
+        return {"status": "missing", "evidence_text": [], "evidence_spans": []}
+    return {"status": "supported", "evidence_text": kept, "evidence_spans": []}
+
+
+def _llm_extract_paragraph(
+    client: LMStudioClient,
+    cfg: ConverterConfig,
+    paragraph: Dict[str, Any],
+) -> Dict[str, Any]:
+    heading = paragraph.get("heading") or ""
+    text = paragraph.get("text") or ""
+    prompt = f"""You are an expert research-paper annotator.
+Rules:
+- Do NOT guess. Use only evidence explicitly present in the paragraph.
+- If the reason is not stated, set reason.status = "missing" and evidence_text = [].
+- Output STRICT JSON only. No markdown fences.
+
+Paragraph heading context: {heading if heading else "(none)"}
+Paragraph:
+\"\"\"{text}\"\"\"
+
+Return JSON with:
+- candidate_roles: array of strings from [rq, hypothesis, method, result, claim, other]
+- discourse: object or null
+  - role: background|prior_work|gap|purpose|rq|hypothesis|method|result|interpretation|implication|limitation|contribution|other
+  - signals: array of short phrases copied from the paragraph
+  - confidence: 0..1
+  - reason: {{status: supported|missing, evidence_text: []}}
+- claim: object or null
+  - claim_type: hypothesis|finding|interpretation|theoretical_proposition|definition|implication|limitation|other
+  - statement: short verbatim excerpt from the paragraph
+  - modality: assert|suggest|speculate
+  - confidence: 0..1
+  - reason: {{status: supported|missing, evidence_text: []}}
+- causal_status: object or null
+  - kind: causal_claim|associational|interpretive|theoretical|unknown
+  - modality: assert|suggest|speculate
+  - confidence: 0..1
+""".strip()
+
+    messages = [
+        {"role": "system", "content": "You output strict JSON only."},
+        {"role": "user", "content": prompt},
+    ]
+    raw = client.chat_completion_text(
+        messages,
+        temperature=cfg.llm_temperature,
+        model=cfg.text_model,
+        max_tokens=cfg.llm_max_tokens,
+    )
+    data = _extract_json(raw) or {}
+    candidate_roles = data.get("candidate_roles") or ["other"]
+    discourse = data.get("discourse")
+    claim = data.get("claim")
+    causal_status = data.get("causal_status")
+
+    if discourse and isinstance(discourse, dict):
+        discourse["reason"] = _normalize_reason(discourse.get("reason") or {}, text)
+    if claim and isinstance(claim, dict):
+        claim["reason"] = _normalize_reason(claim.get("reason") or {}, text)
+
+    return {
+        "paragraph": paragraph,
+        "candidate_roles": candidate_roles,
+        "discourse": discourse,
+        "claim": claim,
+        "causal_status": causal_status,
+    }
+
+
+def _guess_paragraph_pdf_ref(text: str, page_texts: Dict[int, str], page_sizes: List[Tuple[float, float]]) -> List[Dict[str, Any]]:
+    best_page = None
+    best_score = 0.0
+    for page, ptxt in page_texts.items():
+        score = _coverage_ratio(text, ptxt)
+        if score > best_score:
+            best_score = score
+            best_page = page
+    if best_page is None:
+        return []
+    W, H = page_sizes[best_page - 1]
+    return [{"page": best_page, "bbox": [0.0, 0.0, W, H]}]
+
+
+def _build_summary(llm_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    roles = {
+        "rq": {"disc": {"rq", "purpose"}, "claim": set()},
+        "hypothesis": {"disc": {"hypothesis"}, "claim": {"hypothesis"}},
+        "method": {"disc": {"method"}, "claim": set()},
+        "result": {"disc": {"result"}, "claim": {"finding"}},
+        "claim": {"disc": {"interpretation", "implication", "limitation", "contribution"}, "claim": {"interpretation", "implication", "limitation", "definition", "theoretical_proposition"}},
+    }
+
+    summary: Dict[str, Any] = {}
+    for key, kinds in roles.items():
+        candidates: List[Dict[str, Any]] = []
+        for item in llm_results:
+            para = item["paragraph"]
+            disc = item.get("discourse") or {}
+            cl = item.get("claim") or {}
+            confidence = 0.0
+            reason = None
+            if disc and disc.get("role") in kinds["disc"]:
+                confidence = float(disc.get("confidence") or 0.0)
+                reason = disc.get("reason")
+            if cl and cl.get("claim_type") in kinds["claim"]:
+                c_conf = float(cl.get("confidence") or 0.0)
+                if c_conf > confidence:
+                    confidence = c_conf
+                    reason = cl.get("reason")
+            if confidence > 0:
+                candidates.append({
+                    "span": {"md_line_start": para["start_line"], "md_line_end": para["end_line"]},
+                    "confidence": confidence,
+                    "reason": reason,
+                })
+        if not candidates:
+            continue
+        candidates.sort(key=lambda c: c["confidence"], reverse=True)
+        primary = candidates[0]
+        supporting = [c["span"] for c in candidates[1:] if c["confidence"] >= 0.4][:3]
+        reason = primary.get("reason") or {"status": "missing", "evidence_text": [], "evidence_spans": []}
+        summary[key] = {
+            "primary_span": primary["span"],
+            "supporting_spans": supporting,
+            "confidence": primary["confidence"],
+            "reason": {
+                "status": reason.get("status", "missing"),
+                "evidence_spans": reason.get("evidence_spans", []),
+                "evidence_text": reason.get("evidence_text", []),
+            },
+        }
+    return summary
 
 
 # ----------------------------
@@ -2399,6 +2627,8 @@ def build_sidecar_bundle(
     pdf_path: str,
     run_id: str,
     qa: Dict[str, Any],
+    llm_annotations: Optional[List[Dict[str, Any]]] = None,
+    summary: Optional[Dict[str, Any]] = None,
     *,
     pipeline_version: str = "0.1",
 ) -> Dict[str, Any]:
@@ -2442,6 +2672,12 @@ def build_sidecar_bundle(
             "attrs": attrs,
         })
 
+    for ann in (llm_annotations or []):
+        ann_list.append({
+            "id": f"A{next(ann_id):03d}",
+            **ann,
+        })
+
     md_hash = hashlib.sha256(md.encode("utf-8")).hexdigest()
     bundle = {
         "meta": {
@@ -2483,6 +2719,8 @@ def build_sidecar_bundle(
             "warnings": qa.get("issues", []),
         },
     }
+    if summary:
+        bundle["summary"] = summary
     return bundle
 
 
@@ -2602,6 +2840,72 @@ class PDFtoMarkdownTextFirst:
             qa = {"issues": issues, "coverage": cov, "coverage_threshold": self.cfg.coverage_threshold}
             (run_dir / "pass3_qa.json").write_text(json.dumps(qa, ensure_ascii=False, indent=2), encoding="utf-8")
 
+            llm_results: List[Dict[str, Any]] = []
+            llm_annotations: List[Dict[str, Any]] = []
+            summary: Dict[str, Any] = {}
+            if self.cfg.enable_llm_structuring:
+                try:
+                    page_texts: Dict[int, str] = {}
+                    for ln in lines:
+                        page_texts.setdefault(ln.page, [])
+                        page_texts[ln.page].append(ln.text)
+                    page_texts = {p: " ".join(t) for p, t in page_texts.items()}
+                    paragraphs = _paragraphs_from_md(md)
+                    for para in paragraphs:
+                        res = _llm_extract_paragraph(self.client, self.cfg, para)
+                        llm_results.append(res)
+
+                        candidate_roles = res.get("candidate_roles") or []
+                        para_pdf_ref = _guess_paragraph_pdf_ref(para["text"], page_texts, page_sizes)
+                        if res.get("discourse") and para_pdf_ref:
+                            disc = res["discourse"]
+                            reason = disc.get("reason") or {"status": "missing", "evidence_text": [], "evidence_spans": []}
+                            if reason.get("status") == "supported":
+                                reason["evidence_spans"] = [{
+                                    "md_line_start": para["start_line"],
+                                    "md_line_end": para["end_line"],
+                                }]
+                            llm_annotations.append({
+                                "type": "discourse",
+                                "span": {"md_line_start": para["start_line"], "md_line_end": para["end_line"]},
+                                "pdf_ref": para_pdf_ref,
+                                "confidence": float(disc.get("confidence") or 0.0),
+                                "attrs": {
+                                    "role": disc.get("role"),
+                                    "signals": disc.get("signals") or [],
+                                    "reason": reason,
+                                    "candidate_roles": candidate_roles,
+                                },
+                            })
+                        if res.get("claim") and para_pdf_ref:
+                            cl = res["claim"]
+                            reason = cl.get("reason") or {"status": "missing", "evidence_text": [], "evidence_spans": []}
+                            if reason.get("status") == "supported":
+                                reason["evidence_spans"] = [{
+                                    "md_line_start": para["start_line"],
+                                    "md_line_end": para["end_line"],
+                                }]
+                            llm_annotations.append({
+                                "type": "claim",
+                                "span": {"md_line_start": para["start_line"], "md_line_end": para["end_line"]},
+                                "pdf_ref": para_pdf_ref,
+                                "confidence": float(cl.get("confidence") or 0.0),
+                                "attrs": {
+                                    "claim_id": None,
+                                    "claim_type": cl.get("claim_type"),
+                                    "statement": cl.get("statement"),
+                                    "constructs": [],
+                                    "modality": cl.get("modality"),
+                                    "modality_confidence": float(cl.get("confidence") or 0.0),
+                                    "reason": reason,
+                                    "candidate_roles": candidate_roles,
+                                },
+                            })
+                    summary = _build_summary(llm_results)
+                except Exception as e:
+                    with open(run_dir / "warnings.log", "a", encoding="utf-8") as f:
+                        f.write(f"LLM structuring failed: {e}\n")
+
             # Sidecar (paper.bundle.yaml) generation
             try:
                 bundle = build_sidecar_bundle(
@@ -2611,6 +2915,8 @@ class PDFtoMarkdownTextFirst:
                     pdf_path,
                     run_id=ts,
                     qa=qa,
+                    llm_annotations=llm_annotations,
+                    summary=summary,
                 )
                 sidecar_issues = validate_sidecar_bundle(bundle)
                 if sidecar_issues:

@@ -25,6 +25,10 @@ class LMStudioClient:
         response.raise_for_status()
         return response.json()
 
+    def chat_completion_text(self, messages, temperature=0.1, model=None, max_tokens=None, timeout=(20, 900)):
+        response = self.chat_completion(messages, temperature=temperature, model=model, max_tokens=max_tokens, timeout=timeout)
+        return response["choices"][0]["message"]["content"]
+
     def vision_request_multi(self, image_base64_list, prompt, model=None, temperature=0.1, max_tokens=900, timeout=(20, 900)):
         messages = [
             {
