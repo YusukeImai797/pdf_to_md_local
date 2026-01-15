@@ -1,0 +1,268 @@
+meta:
+  paper_id: "smith2023_psychsafety"
+  source_pdf:
+    filename: "smith2023.pdf"
+    pages: 18
+  pipeline:
+    version: "0.9"
+    run_id: "20260115-090000"
+  coordinate_system:
+    bbox_units: "pdf_points"
+    origin: "bottom_left"
+    page_indexing: "1-index"
+  span_reference:
+    primary: "md_line"
+    md_line_indexing: "1-index"
+
+outputs:
+  markdown: "paper.md"
+  sidecar: "paper.bundle.yaml"
+  annotations: "paper.ann.jsonl"
+  qc: "paper.qc.json"
+  meta: "paper.meta.json"
+
+constructs:
+  - construct_id: "K_psych_safety"
+    name: "Psychological safety"
+    level: "team"
+    definition_span: { md_line_start: 62, md_line_end: 66 }
+  - construct_id: "K_team_learning"
+    name: "Team learning"
+    level: "team"
+    definition_span: { md_line_start: 67, md_line_end: 71 }
+  - construct_id: "K_leader_inclusiveness"
+    name: "Leader inclusiveness"
+    level: "team"
+    definition_span: { md_line_start: 72, md_line_end: 75 }
+
+annotations:
+  # --- リンクラベル ---
+  # --- 見出し／セクション ---
+  - id: "A001"
+    type: "heading"
+    span: { md_line_start: 1, md_line_end: 1 }
+    pdf_ref: [{ page: 1, bbox: [72, 740, 520, 770] }]
+    confidence: 1.0
+    attrs: { level: 1, title: "Introduction" }
+
+  - id: "A002"
+    type: "section"
+    span: { md_line_start: 1, md_line_end: 120 }
+    pdf_ref: [{ page: 1, bbox: [60, 60, 540, 780] }]
+    confidence: 0.95
+    attrs: { label: "introduction" }
+
+  # --- 文意（導入の流れ） ---
+  - id: "A010"
+    type: "discourse"
+    span: { md_line_start: 10, md_line_end: 22 }
+    pdf_ref: [{ page: 1, bbox: [70, 520, 520, 700] }]
+    confidence: 0.86
+    attrs:
+      role: "prior_work"
+      signals: ["prior research", "has examined", "extant literature"]
+
+  - id: "A011"
+    type: "discourse"
+    span: { md_line_start: 23, md_line_end: 30 }
+    pdf_ref: [{ page: 1, bbox: [70, 460, 520, 515] }]
+    confidence: 0.78
+    attrs:
+      role: "gap"
+      signals: ["however", "little is known", "remains unclear"]
+
+  - id: "A012"
+    type: "discourse"
+    span: { md_line_start: 31, md_line_end: 34 }
+    pdf_ref: [{ page: 1, bbox: [70, 420, 520, 455] }]
+    confidence: 0.83
+    attrs:
+      role: "rq"
+      signals: ["we ask", "this study examines"]
+      candidate_roles: ["rq", "purpose"]
+
+  # --- 引用（本文内）と参考文献 ---
+  - id: "A020"
+    type: "citation"
+    span: { md_line_start: 14, md_line_end: 14 }
+    pdf_ref: [{ page: 1, bbox: [310, 610, 420, 625] }]
+    confidence: 0.95
+    attrs:
+      in_text: "(Edmondson, 1999)"
+      style: "author_year"
+      ref_id: "R_edmondson1999"
+      citation_role: "definition"
+      role_confidence: 0.80
+      ref_span: { md_line_start: 410, md_line_end: 412 }
+
+  - id: "A021"
+    type: "reference"
+    span: { md_line_start: 410, md_line_end: 412 }
+    pdf_ref: [{ page: 17, bbox: [70, 600, 520, 740] }]
+    confidence: 1.0
+    attrs:
+      ref_id: "R_edmondson1999"
+      raw: "Edmondson, A. (1999). Psychological safety and learning behavior in work teams..."
+
+  # --- 仮説（主張単位） ---
+  - id: "A100"
+    type: "discourse"
+    span: { md_line_start: 90, md_line_end: 92 }
+    pdf_ref: [{ page: 2, bbox: [70, 240, 520, 280] }]
+    confidence: 0.92
+    attrs: { role: "hypothesis", signals: ["Hypothesis 1"] }
+
+  - id: "A101"
+    type: "claim"
+    span: { md_line_start: 90, md_line_end: 92 }
+    pdf_ref: [{ page: 2, bbox: [70, 240, 520, 280] }]
+    confidence: 0.90
+    attrs:
+      claim_id: "C_H1"
+      claim_type: "hypothesis"
+      statement: "Psychological safety is positively related to team learning."
+      constructs: ["K_psych_safety", "K_team_learning"]
+      modality: "assert"
+      modality_confidence: 0.85
+
+  - id: "A102"
+    type: "claim"
+    span: { md_line_start: 93, md_line_end: 96 }
+    pdf_ref: [{ page: 2, bbox: [70, 200, 520, 238] }]
+    confidence: 0.86
+    attrs:
+      claim_id: "C_H2"
+      claim_type: "hypothesis"
+      statement: "Leader inclusiveness moderates the effect of psychological safety on team learning."
+      constructs: ["K_leader_inclusiveness", "K_psych_safety", "K_team_learning"]
+      modality: "assert"
+      modality_confidence: 0.80
+
+  # --- 方法（文意） ---
+  - id: "A200"
+    type: "section"
+    span: { md_line_start: 121, md_line_end: 260 }
+    pdf_ref: [{ page: 4, bbox: [60, 60, 540, 780] }]
+    confidence: 0.90
+    attrs: { label: "methods" }
+
+  - id: "A201"
+    type: "discourse"
+    span: { md_line_start: 140, md_line_end: 162 }
+    pdf_ref: [{ page: 4, bbox: [70, 380, 520, 560] }]
+    confidence: 0.80
+    attrs: { role: "method", signals: ["sample", "measures", "procedure"] }
+
+  # --- 結果（主張単位：発見） ---
+  - id: "A300"
+    type: "section"
+    span: { md_line_start: 261, md_line_end: 340 }
+    pdf_ref: [{ page: 7, bbox: [60, 60, 540, 780] }]
+    confidence: 0.92
+    attrs: { label: "results" }
+
+  - id: "A301"
+    type: "claim"
+    span: { md_line_start: 280, md_line_end: 284 }
+    pdf_ref: [{ page: 7, bbox: [70, 420, 520, 470] }]
+    confidence: 0.84
+    attrs:
+      claim_id: "C_F1"
+      claim_type: "finding"
+      statement: "The association between psychological safety and team learning is positive and statistically significant."
+      constructs: ["K_psych_safety", "K_team_learning"]
+      modality: "assert"
+      modality_confidence: 0.75
+
+  # --- 主張趣旨（relationに載せる例） ---
+  - id: "A400"
+    type: "relation"
+    span: { md_line_start: 280, md_line_end: 284 }
+    pdf_ref: [{ page: 7, bbox: [70, 420, 520, 470] }]
+    confidence: 0.78
+    attrs:
+      rel_id: "REL_C_H1_to_C_F1"
+      source_claim_id: "C_H1"
+      target_claim_id: "C_F1"
+      relation_type: "support"
+      evidence_spans:
+        - { md_line_start: 280, md_line_end: 284 }
+      causal_status:
+        kind: "associational"
+        identification: "cross_sectional"
+        modality: "assert"
+        confidence: 0.60
+
+  # --- 図表 ---
+  - id: "A500"
+    type: "figure"
+    span: { md_line_start: 350, md_line_end: 351 }
+    pdf_ref: [{ page: 8, bbox: [70, 610, 520, 680] }]
+    confidence: 0.90
+    attrs:
+      label: "Figure 1"
+      caption_span: { md_line_start: 350, md_line_end: 351 }
+      quality: "high"
+
+  # --- 限界 ---
+  - id: "A600"
+    type: "discourse"
+    span: { md_line_start: 365, md_line_end: 372 }
+    pdf_ref: [{ page: 9, bbox: [70, 120, 520, 200] }]
+    confidence: 0.82
+    attrs: { role: "limitation", signals: ["limitations", "cross-sectional"] }
+
+qc:
+  overall_status: "pass_with_warnings"
+  metrics:
+    citation_extraction_rate: 0.91
+    references_detected: true
+    figure_table_coverage: 0.85
+    heading_consistency: true
+    table_integrity_score_mean: 0.74
+  warnings:
+    - code: "W_TABLE_LOW_CONF"
+      message: "Table 2 has unstable column boundaries; rendered as text block."
+      span: { md_line_start: 320, md_line_end: 334 }
+
+summary:
+  rq:
+    primary_span: { md_line_start: 31, md_line_end: 34 }
+    supporting_spans: [{ md_line_start: 10, md_line_end: 22 }]
+    confidence: 0.83
+    reason:
+      status: "supported"
+      evidence_spans: [{ md_line_start: 10, md_line_end: 22 }]
+      evidence_text: ["we ask", "this study examines"]
+  hypothesis:
+    primary_span: { md_line_start: 90, md_line_end: 92 }
+    supporting_spans: [{ md_line_start: 93, md_line_end: 96 }]
+    confidence: 0.84
+    reason:
+      status: "missing"
+      evidence_spans: []
+      evidence_text: []
+  method:
+    primary_span: { md_line_start: 140, md_line_end: 162 }
+    supporting_spans: []
+    confidence: 0.80
+    reason:
+      status: "supported"
+      evidence_spans: [{ md_line_start: 140, md_line_end: 162 }]
+      evidence_text: ["sample", "measures", "procedure"]
+  result:
+    primary_span: { md_line_start: 280, md_line_end: 284 }
+    supporting_spans: []
+    confidence: 0.84
+    reason:
+      status: "missing"
+      evidence_spans: []
+      evidence_text: []
+  claim:
+    primary_span: { md_line_start: 280, md_line_end: 284 }
+    supporting_spans: [{ md_line_start: 365, md_line_end: 372 }]
+    confidence: 0.78
+    reason:
+      status: "supported"
+      evidence_spans: [{ md_line_start: 365, md_line_end: 372 }]
+      evidence_text: ["limitations", "cross-sectional"]

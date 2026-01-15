@@ -20,6 +20,8 @@ import time
 import base64
 import datetime
 import subprocess
+import hashlib
+from itertools import count
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
 from PIL import Image
+import yaml
 
 from lmstudio_client import LMStudioClient
 
@@ -283,6 +286,38 @@ def _strip_generated_blocks_for_coverage(md: str) -> str:
             continue
         kept.append(ln)
     return "\n".join(kept)
+
+
+def _bbox_union(bboxes: List[Tuple[float, float, float, float]]) -> Tuple[float, float, float, float]:
+    x0 = min(b[0] for b in bboxes)
+    y0 = min(b[1] for b in bboxes)
+    x1 = max(b[2] for b in bboxes)
+    y1 = max(b[3] for b in bboxes)
+    return (x0, y0, x1, y1)
+
+
+def _to_bottom_left_bbox(bbox: Tuple[float, float, float, float], page_h: float) -> List[float]:
+    x0, y0, x1, y1 = bbox
+    return [x0, page_h - y1, x1, page_h - y0]
+
+
+def _sources_to_pdf_refs(sources: List["TextLine"], page_sizes: List[Tuple[float, float]]) -> List[Dict[str, Any]]:
+    by_page: Dict[int, List[Tuple[float, float, float, float]]] = {}
+    for ln in sources:
+        by_page.setdefault(ln.page, []).append(ln.bbox)
+    refs: List[Dict[str, Any]] = []
+    for page, bboxes in by_page.items():
+        _, page_h = page_sizes[page - 1]
+        union_bbox = _bbox_union(bboxes)
+        refs.append({"page": page, "bbox": _to_bottom_left_bbox(union_bbox, page_h)})
+    return refs
+
+
+def _extract_label_from_caption(text: str) -> Optional[str]:
+    m = re.match(r"^(Figure|Fig\.?|FIGURE|FIG\.?|Table|Tab\.?|TABLE|TAB\.?|図|表)\s*\d+[A-Za-z]?", text.strip())
+    if not m:
+        return None
+    return m.group(0).replace("FIGURE", "Figure").replace("FIG.", "Fig.").replace("TABLE", "Table").replace("TAB.", "Tab.")
 
 
 # ----------------------------
@@ -1213,6 +1248,7 @@ def build_markdown_from_text_layer(
     baseline_accum: List[str] = []
 
     cap_map: Dict[str, Dict[str, Any]] = {}
+    annotation_candidates: List[Dict[str, Any]] = []
     cap_counter = 0
     title_found = False  # Track if we've found the main title
     abstract_inserted = False
@@ -1236,6 +1272,16 @@ def build_markdown_from_text_layer(
     h1_threshold = base_size * 1.45  # Title: larger than body
     h2_threshold = base_size * 1.20  # Major section hint
     h3_threshold = base_size * 1.10  # Minor section hint
+
+    def _add_annotation(kind: str, text: str, sources: List[TextLine], attrs: Dict[str, Any]) -> None:
+        if not sources:
+            return
+        annotation_candidates.append({
+            "kind": kind,
+            "text": text,
+            "sources": sources,
+            "attrs": attrs,
+        })
 
     def classify_heading(ln: TextLine, text: str) -> Tuple[Optional[int], Optional[str]]:
         """
@@ -1300,11 +1346,15 @@ def build_markdown_from_text_layer(
         
         return None, None
 
-    def extract_front_matter(page_lines: List[TextLine], page_h_pt: float) -> Tuple[str, List[str], List[str], List[str], int]:
+    def extract_front_matter(page_lines: List[TextLine], page_h_pt: float) -> Tuple[str, List[TextLine], List[str], List[TextLine], List[str], List[TextLine], List[str], List[TextLine], int]:
         source_lines: List[str] = []
+        source_ln_objs: List[TextLine] = []
         title_lines: List[str] = []
+        title_ln_objs: List[TextLine] = []
         authors: List[str] = []
+        author_ln_objs: List[TextLine] = []
         affiliations: List[str] = []
+        affiliation_ln_objs: List[TextLine] = []
 
         i = 0
         page_max_size = max((ln.size for ln in page_lines if ln.size > 0), default=0.0)
@@ -1323,6 +1373,7 @@ def build_markdown_from_text_layer(
             ymid = ((ln.bbox[1] + ln.bbox[3]) / 2.0) / page_h_pt
             if ymid <= 0.12 and _looks_like_source_line(text):
                 source_lines.append(_clean_leading_singleton(text))
+                source_ln_objs.append(ln)
                 i += 1
                 continue
             break
@@ -1343,6 +1394,7 @@ def build_markdown_from_text_layer(
                     is_title = True
             if is_title and not _looks_like_source_line(text):
                 title_lines.append(text)
+                title_ln_objs.append(ln)
                 i += 1
                 continue
             break
@@ -1356,15 +1408,18 @@ def build_markdown_from_text_layer(
                 continue
             if _looks_like_author_line(text):
                 authors.append(text)
+                author_ln_objs.append(ln)
                 i += 1
                 continue
             if _looks_like_affiliation_line(text):
                 affiliations.append(text)
+                affiliation_ln_objs.append(ln)
                 i += 1
                 continue
             # Heuristic: short title-case lines after authors are likely affiliations
             if authors and len(text) <= 80 and _is_title_case(text) and not _section_kind(text):
                 affiliations.append(text)
+                affiliation_ln_objs.append(ln)
                 i += 1
                 continue
             if _section_kind(text):
@@ -1376,7 +1431,7 @@ def build_markdown_from_text_layer(
             break
 
         title = " ".join(t for t in title_lines if t).strip()
-        return title, authors, affiliations, source_lines, i
+        return title, title_ln_objs, authors, author_ln_objs, affiliations, affiliation_ln_objs, source_lines, source_ln_objs, i
 
     def flush_pending_footnotes(*, force: bool = False) -> None:
         nonlocal pending_footnotes, last_block_type, last_para_index
@@ -1554,10 +1609,12 @@ def build_markdown_from_text_layer(
 
         start_idx = 0
         if p == 1 and not title_found:
-            title, authors, affiliations, sources, start_idx = extract_front_matter(ordered, H)
+            title, title_ln_objs, authors, author_ln_objs, affiliations, affiliation_ln_objs, sources, source_ln_objs, start_idx = extract_front_matter(ordered, H)
             if title:
-                md_lines.append(f"# {title}")
+                title_line = f"# {title}"
+                md_lines.append(title_line)
                 md_lines.append("")
+                _add_annotation("heading", title_line, title_ln_objs, {"level": 1, "title": title})
                 title_found = True
             if authors:
                 md_lines.append("**Authors:** " + "; ".join(authors))
@@ -1633,8 +1690,10 @@ def build_markdown_from_text_layer(
 
                         flush_pending_captions(preserve_last_block=False)
                         prefix = "#" * heading_level
-                        md_lines.append(f"{prefix} {heading_text}")
+                        heading_line = f"{prefix} {heading_text}"
+                        md_lines.append(heading_line)
                         md_lines.append("")
+                        _add_annotation("heading", heading_line, [ln], {"level": heading_level, "title": heading_text})
                         last_block_type = "heading"
                         last_para_index = None
                         first_content_on_page = False
@@ -1655,11 +1714,14 @@ def build_markdown_from_text_layer(
             if ctype:
                 cap_counter += 1
                 marker = f"@@CAP_{cap_counter:04d}@@"
+                label = _extract_label_from_caption(text)
+                caption_line = f"**[{text}]**"
                 pending_captions.append([
-                    f"**[{text}]**",  # caption from PDF
+                    caption_line,  # caption from PDF
                     marker,           # placeholder
                     "",
                 ])
+                _add_annotation(ctype, caption_line, [ln], {"label": label} if label else {})
 
                 cap_info = {
                     "type": ctype,
@@ -1682,10 +1744,13 @@ def build_markdown_from_text_layer(
                         continuing_prev_ref = True
                         prev_entry = md_lines[last_para_index].lstrip("- ").strip()
                         entry_lines = [prev_entry, text]
+                        entry_sources: List[TextLine] = [ln]
                     else:
                         entry_lines = [text]
+                        entry_sources = [ln]
                 else:
                     entry_lines = [text]
+                    entry_sources = [ln]
                 note_mode = (not refs_started and re.match(r"^(Note|Notes):", text))
                 if continuing_prev_ref:
                     note_mode = False
@@ -1732,6 +1797,7 @@ def build_markdown_from_text_layer(
                         entry_lines[-1] = entry_lines[-1][:-1] + next_text
                     else:
                         entry_lines.append(next_text)
+                    entry_sources.append(next_ln)
                     prev_y = next_ln.bbox[3]
                     if cols == 2:
                         cur_col = 0 if next_ln.bbox[0] < split_x else 1
@@ -1767,8 +1833,12 @@ def build_markdown_from_text_layer(
                             md_lines[last_para_index] = f"- {parts[0]}"
                             start_idx = 1
                         for part in parts[start_idx:]:
-                            md_lines.append(f"- {part}")
+                            ref_line = f"- {part}"
+                            md_lines.append(ref_line)
                             md_lines.append("")
+                            _add_annotation("reference", ref_line, entry_sources, {
+                                "raw": part,
+                            })
                             last_block_type = "para"
                             last_para_index = len(md_lines) - 2
                             refs_started = True
@@ -1791,6 +1861,7 @@ def build_markdown_from_text_layer(
                 heading_level, kind = classify_heading(ln, text)
             if heading_level:
                 heading_text = text
+                heading_sources: List[TextLine] = [ln]
                 k = i
                 while True:
                     k_next = k + 1
@@ -1814,6 +1885,7 @@ def build_markdown_from_text_layer(
                         vgap = next_ln.bbox[1] - ln.bbox[3]
                         if same_col and vgap <= 20:
                             heading_text = f"{heading_text} {next_text}"
+                            heading_sources.append(next_ln)
                             ln = next_ln
                             k = k_next
                             continue
@@ -1841,8 +1913,10 @@ def build_markdown_from_text_layer(
 
                 flush_pending_captions(preserve_last_block=False)
                 prefix = "#" * heading_level
-                md_lines.append(f"{prefix} {heading_text}")
+                heading_line = f"{prefix} {heading_text}"
+                md_lines.append(heading_line)
                 md_lines.append("")
+                _add_annotation("heading", heading_line, heading_sources, {"level": heading_level, "title": heading_text})
                 last_block_type = "heading"
                 last_para_index = None
                 first_content_on_page = False
@@ -1875,11 +1949,14 @@ def build_markdown_from_text_layer(
                 if next_caption_type:
                     cap_counter += 1
                     marker = f"@@CAP_{cap_counter:04d}@@"
+                    label = _extract_label_from_caption(next_text)
+                    caption_line = f"**[{next_text}]**"
                     pending_captions.append([
-                        f"**[{next_text}]**",  # caption from PDF
+                        caption_line,  # caption from PDF
                         marker,               # placeholder
                         "",
                     ])
+                    _add_annotation(next_caption_type, caption_line, [next_ln], {"label": label} if label else {})
                     cap_info = {
                         "type": next_caption_type,
                         "caption": next_text,
@@ -1993,7 +2070,7 @@ def build_markdown_from_text_layer(
 
     md = "\n".join(md_lines).strip() + "\n"
     baseline_text = "\n".join(baseline_accum)
-    info = {"captions": cap_map}
+    info = {"captions": cap_map, "annotation_candidates": annotation_candidates}
     return md, baseline_text, info
 
 
@@ -2315,6 +2392,126 @@ def validate_figures(md: str, cfg: ConverterConfig) -> List[str]:
     return issues
 
 
+def build_sidecar_bundle(
+    md: str,
+    annotation_candidates: List[Dict[str, Any]],
+    page_sizes: List[Tuple[float, float]],
+    pdf_path: str,
+    run_id: str,
+    qa: Dict[str, Any],
+    *,
+    pipeline_version: str = "0.1",
+) -> Dict[str, Any]:
+    lines = md.splitlines()
+    ann_list: List[Dict[str, Any]] = []
+    ann_id = count(1)
+    ref_id = count(1)
+
+    last_idx = 0
+    for cand in annotation_candidates:
+        text = cand["text"]
+        found_idx = None
+        for i in range(last_idx, len(lines)):
+            if lines[i] == text:
+                found_idx = i
+                break
+        if found_idx is None:
+            continue
+        last_idx = found_idx
+        line_no = found_idx + 1
+        sources = cand.get("sources") or []
+        pdf_ref = _sources_to_pdf_refs(sources, page_sizes)
+        if not pdf_ref:
+            continue
+
+        attrs = dict(cand.get("attrs") or {})
+        kind = cand["kind"]
+        if kind in ("figure", "table"):
+            attrs.setdefault("caption_span", {"md_line_start": line_no, "md_line_end": line_no})
+            attrs.setdefault("quality", "medium")
+        if kind == "reference":
+            attrs.setdefault("ref_id", f"R_{next(ref_id):04d}")
+            attrs.setdefault("raw", text.lstrip("- ").strip())
+
+        ann_list.append({
+            "id": f"A{next(ann_id):03d}",
+            "type": kind,
+            "span": {"md_line_start": line_no, "md_line_end": line_no},
+            "pdf_ref": pdf_ref,
+            "confidence": 1.0,
+            "attrs": attrs,
+        })
+
+    md_hash = hashlib.sha256(md.encode("utf-8")).hexdigest()
+    bundle = {
+        "meta": {
+            "paper_id": Path(pdf_path).stem,
+            "source_pdf": {
+                "filename": Path(pdf_path).name,
+                "pages": len(page_sizes),
+            },
+            "pipeline": {
+                "version": pipeline_version,
+                "run_id": run_id,
+            },
+            "coordinate_system": {
+                "bbox_units": "pdf_points",
+                "origin": "bottom_left",
+                "page_indexing": "1-index",
+            },
+            "span_reference": {
+                "primary": "md_line",
+                "md_line_indexing": "1-index",
+            },
+            "md_sha256": md_hash,
+        },
+        "outputs": {
+            "markdown": f"{Path(pdf_path).stem}.md",
+            "sidecar": "paper.bundle.yaml",
+            "annotations": "paper.ann.jsonl",
+            "qc": "paper.qc.json",
+            "meta": "paper.meta.json",
+        },
+        "constructs": [],
+        "annotations": ann_list,
+        "qc": {
+            "overall_status": "pass_with_warnings" if qa.get("issues") else "pass",
+            "metrics": {
+                "coverage": qa.get("coverage"),
+                "coverage_threshold": qa.get("coverage_threshold"),
+            },
+            "warnings": qa.get("issues", []),
+        },
+    }
+    return bundle
+
+
+def validate_sidecar_bundle(bundle: Dict[str, Any]) -> List[str]:
+    issues: List[str] = []
+    outputs = bundle.get("outputs", {})
+    if outputs.get("sidecar") != "paper.bundle.yaml":
+        issues.append("sidecar_output_missing_or_invalid")
+    annotations = bundle.get("annotations", [])
+    if not annotations:
+        issues.append("sidecar_no_annotations")
+        return issues
+    for ann in annotations:
+        span = ann.get("span", {})
+        if "md_line_start" not in span or "md_line_end" not in span:
+            issues.append("sidecar_annotation_missing_span")
+            break
+        pdf_ref = ann.get("pdf_ref")
+        if not isinstance(pdf_ref, list) or not pdf_ref:
+            issues.append("sidecar_annotation_missing_pdf_ref")
+            break
+        for ref in pdf_ref:
+            bbox = ref.get("bbox")
+            if not isinstance(bbox, list) or len(bbox) != 4:
+                issues.append("sidecar_annotation_invalid_bbox")
+                break
+    return issues
+
+
 # ----------------------------
 # Main converter
 # ----------------------------
@@ -2404,6 +2601,43 @@ class PDFtoMarkdownTextFirst:
             cov = _coverage_ratio(baseline_text, cov_md)
             qa = {"issues": issues, "coverage": cov, "coverage_threshold": self.cfg.coverage_threshold}
             (run_dir / "pass3_qa.json").write_text(json.dumps(qa, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            # Sidecar (paper.bundle.yaml) generation
+            try:
+                bundle = build_sidecar_bundle(
+                    md,
+                    info.get("annotation_candidates", []),
+                    page_sizes,
+                    pdf_path,
+                    run_id=ts,
+                    qa=qa,
+                )
+                sidecar_issues = validate_sidecar_bundle(bundle)
+                if sidecar_issues:
+                    qa["issues"].extend(sidecar_issues)
+                    issues.extend(sidecar_issues)
+                    (run_dir / "pass3_qa.json").write_text(json.dumps(qa, ensure_ascii=False, indent=2), encoding="utf-8")
+                    bundle["qc"]["warnings"] = qa["issues"]
+                    bundle["qc"]["overall_status"] = "pass_with_warnings"
+
+                (run_dir / "paper.bundle.yaml").write_text(
+                    yaml.safe_dump(bundle, allow_unicode=True, sort_keys=False),
+                    encoding="utf-8",
+                )
+                (run_dir / "paper.qc.json").write_text(
+                    json.dumps(bundle.get("qc", {}), ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                (run_dir / "paper.meta.json").write_text(
+                    json.dumps(bundle.get("meta", {}), ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                with open(run_dir / "paper.ann.jsonl", "w", encoding="utf-8") as f:
+                    for ann in bundle.get("annotations", []):
+                        f.write(json.dumps(ann, ensure_ascii=False) + "\n")
+            except Exception as e:
+                with open(run_dir / "warnings.log", "a", encoding="utf-8") as f:
+                    f.write(f"Sidecar generation failed: {e}\n")
 
             print(f"  - Coverage: {cov:.3f} (threshold: {self.cfg.coverage_threshold})")
             recorder.checkpoint("pass3_done", coverage=cov, issues=issues)
